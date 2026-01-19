@@ -145,8 +145,8 @@ while IFS= read -r svc || [[ -n "$svc" ]]; do
     if is_running "$svc"; then
       log "OK | $svc running"
     else
-        if $DIY-RUN; then
-         log "DIY-RUN | Would restart $svc"
+        if $DRY-RUN; then
+         log "DRY-RUN | Would restart $svc"
         elif $RESTART; then
             log "RESTARTING | $svc"
             if retry 3 2 restart_service "$svc"; then
