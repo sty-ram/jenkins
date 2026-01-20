@@ -1,99 +1,102 @@
-#!/usr/bin/env bash                                                                                         
-
+#!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
+
 # -----------------------------
-# Cors-safe Enviromentment
+# CRON-SAFE ENVIRONMENT
 # -----------------------------
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
-export PATH 
+export PATH
+
 # -----------------------------
 # Defaults
 # -----------------------------
 SERVICES_FILE="services.txt"
 LOG_FILE="service_check.log"
 RESTART=false
+DRY_RUN=false
 FAILED=0
 TMP_FILE="$(mktemp)"
+STATE_FILE="/var/tmp/service_tool.state"
 
+# Allowed hosts
 ALLOWED_HOSTS=("ip-10-20-1-198")
+
 # -----------------------------
 # Usage
 # -----------------------------
 usage() {
-  echo "Usage: $0 [-f services_file] [-l log_file] [-r]"
+  echo "Usage: $0 [-f services_file] [-l log_file] [-r] [-D]"
   exit 1
 }
 
 # -----------------------------
 # Argument parsing
 # -----------------------------
-while getopts ":f:l:rh" opt; do
+while getopts ":f:l:rhD" opt; do
   case "$opt" in
     f) SERVICES_FILE="$OPTARG" ;;
     l) LOG_FILE="$OPTARG" ;;
     r) RESTART=true ;;
+    D) DRY_RUN=true ;;
     h) usage ;;
     *) usage ;;
   esac
 done
+
+# -----------------------------
+# Logging (early)
 # -----------------------------
 log() {
-  printf '%s | %s\n' "$(date '+%F %T')" "$1" | tee -a "$LOG_FILE"
+  printf '%s | %s\n' "$(/bin/date '+%F %T')" "$1"
 }
-#redirecting all output (corn hygeine)
+
+# Redirect all output (cron hygiene)
 exec > >(tee -a "$LOG_FILE") 2>&1
+
 # -----------------------------
-# SAFEGUARD
+# SAFETY GUARDS
 # -----------------------------
-# gurde 1: Host allowlist
-HOSTNAME="$(hostname)"
+HOSTNAME="$(/bin/hostname)"
+
 if [[ ! " ${ALLOWED_HOSTS[*]} " =~ " ${HOSTNAME} " ]]; then
-  log "FATAL | Script no allowed on host: ${HOSTNAME}"
+  log "FATAL | Script not allowed on host: $HOSTNAME"
   exit 4
-  fi
-# Guarde 2: Services file existence
+fi
+
 if [[ ! -f "$SERVICES_FILE" ]]; then
   log "FATAL | Services file not found: $SERVICES_FILE"
   exit 2
 fi
-# Guarde 3: Services file not empty
+
 if [[ ! -s "$SERVICES_FILE" ]]; then
-    log "FATAL | Services file is empty: $SERVICES_FILE"
-    exit 5
-fi
-# Guarde 4: Restart mode requries root
-if $RESTART && [[ "$(/usr/bin/id -u)" -ne 0]]; then
-    log "FATAL | Restart mode requires root privileges."
-    exit 3
+  log "FATAL | Services file is empty"
+  exit 5
 fi
 
-# # Validation
-# # -----------------------------
-# if [[ ! -f "$SERVICES_FILE" ]]; then
-#   echo "❌ Services file not found: $SERVICES_FILE"
-#   exit 2
-# fi
+if $RESTART && [[ $(/usr/bin/id -u) -ne 0 ]]; then
+  log "FATAL | Restart mode requires root privileges"
+  exit 3
+fi
 
 # -----------------------------
 # Cleanup & traps
-#  -----------------------------
+# -----------------------------
 cleanup() {
-    [[ -f "$TMP_FILE" ]] && /bin/rm -f "$TMP_FILE"
+  [[ -f "$TMP_FILE" ]] && /bin/rm -f "$TMP_FILE"
 }
+
 trap cleanup EXIT
-trap 'log "error | Script failed on line $LINENO" exit 1' ERR
+trap 'log "ERROR | Script failed on line $LINENO"; exit 1' ERR
 trap 'log "INTERRUPTED | Script stopped by user"; exit 130' INT
 
 # -----------------------------
-#Helper functions
+# Helper functions
 # -----------------------------
-# Installed = unit exists (even if stopped)
 is_installed() {
-  /bin/systemctl show "$1" -p LoadState --value 2>/dev/null | grep -qx loaded
+  /bin/systemctl show "$1" -p LoadState --value 2>/dev/null | /bin/grep -qx loaded
 }
 
-# Running = active
 is_running() {
   /bin/systemctl is-active --quiet "$1"
 }
@@ -126,6 +129,24 @@ retry() {
 }
 
 # -----------------------------
+# Idempotency helpers
+# -----------------------------
+mark_restarted() {
+  echo "$1" >> "$STATE_FILE"
+}
+
+was_restarted() {
+  /bin/grep -qx "$1" "$STATE_FILE" 2>/dev/null
+}
+
+# Reset state if older than 1 hour
+if [[ -f "$STATE_FILE" ]]; then
+  if (( $(/bin/date +%s) - $(/bin/stat -c %Y "$STATE_FILE") > 3600 )); then
+    /bin/rm -f "$STATE_FILE"
+  fi
+fi
+
+# -----------------------------
 # Prepare temp file
 # -----------------------------
 /bin/cp "$SERVICES_FILE" "$TMP_FILE"
@@ -134,7 +155,6 @@ retry() {
 # Main loop
 # -----------------------------
 while IFS= read -r svc || [[ -n "$svc" ]]; do
-  # sanitize input
   svc="${svc//$'\r'/}"
   svc="${svc#"${svc%%[![:space:]]*}"}"
   svc="${svc%"${svc##*[![:space:]]}"}"
@@ -145,17 +165,22 @@ while IFS= read -r svc || [[ -n "$svc" ]]; do
     if is_running "$svc"; then
       log "OK | $svc running"
     else
-        if $DRY-RUN; then
-         log "DRY-RUN | Would restart $svc"
-        elif $RESTART; then
-            log "RESTARTING | $svc"
-            if retry 3 2 restart_service "$svc"; then
+      if $DRY_RUN; then
+        log "DRY-RUN | Would restart $svc"
+      elif $RESTART; then
+        if was_restarted "$svc"; then
+          log "SKIP | $svc already restarted recently"
+        else
+          log "RESTARTING | $svc"
+          if retry 3 2 restart_service "$svc"; then
+            mark_restarted "$svc"
             FAILED=1
-        else
-          log "ERROR | $svc failed to restart after retries"
-          exit 1
+          else
+            log "ERROR | $svc failed to restart after retries"
+            exit 1
+          fi
         fi
-        else
+      else
         log "DOWN | $svc (restart disabled)"
       fi
     fi
